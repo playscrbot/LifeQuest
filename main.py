@@ -8,11 +8,17 @@ import urllib.parse
 import webbrowser
 import threading
 import queue
+import json
+
+import traceback
 
 from database import Database
 from game_logic import XP_REWARDS, level_from_xp, xp_for_next_level, check_achievements, get_streak, get_streak_status, STREAK_MILESTONES
 
 from trello_client import TrelloClient, TrelloAPIError
+from trello_callback import TrelloCallbackServer
+from notion_client import NotionClient, NotionAPIError, page_to_note
+
 from config import TRELLO_AUTO_SYNC_SECONDS
 
 BG = "#11111b"
@@ -60,6 +66,18 @@ class LifeQuestApp(tk.Tk):
         self.trello_auto_sync_seconds = TRELLO_AUTO_SYNC_SECONDS
         self.trello_auto_after_id = None
         self.trello_status = "Auto-sync is off"
+        self.trello_callback_server = None
+        self.trello_callback_thread = None
+        self.trello_auth_poll_id = None
+        self.trello_auth_window = None
+        self.notion_client = None  # Notion token is held in memory only.
+        self.notion_user = None
+        self.notion_database_id = ""
+        self.notion_data_source_id = None
+        self.notion_database_name = ""
+        self.notion_status = "Not connected"
+        self.notion_sync_in_progress = False
+        self.notion_sync_queue = queue.Queue()
         self.current_page = "Dashboard"
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._style()
@@ -318,11 +336,15 @@ class LifeQuestApp(tk.Tk):
         tk.Label(right, text=f"Reward: +{challenge['xp']} XP bonus", bg=PANEL, fg=GREEN,
                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
         
-        if not challenge["claimed"]:
-            tk.Button(right, text="Claim challenge reward", command=self.claim_challenge,
-                      bg=PURPLE_DARK, fg="white", relief="flat", padx=12, pady=8).pack(anchor="w", pady=12)
-        else:
-            tk.Label(right, text="✓ Today's reward claimed", bg=PANEL, fg=GREEN).pack(anchor="w", pady=12)
+        progress_count = self.db.get_daily_challenge_progress()
+        tk.Label(right, text=f"Progress: {progress_count}/3 missions completed", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 5))
+                 
+        if challenge["claimed"]:
+            tk.Label(right, text="✓ Today's reward claimed", bg=PANEL, fg=GREEN).pack(anchor="w", pady=12)    
+        elif progress_count >= 3:
+            tk.Button(right, text="Claim +40 XP reward", command=self.claim_challenge, 
+                 bg=PURPLE_DARK, fg="white", relief="flat", padx=12, pady=8).pack(anchor="w", pady=12)
 
         # Always show the next locked achievement; before the first unlock this is the first target.
         unlocked_rows = self.db.get_unlocked_achievements()
@@ -412,10 +434,31 @@ class LifeQuestApp(tk.Tk):
 
     def claim_challenge(self):
         challenge = self.db.get_daily_challenge()
+        progress = self.db.get_daily_challenge_progress(challenge["day"])
+
+        if progress < 3:
+            messagebox.showinfo(
+                "Challenge incomplete",
+                f"You have completed {progress}/3 missions.\n"
+                f"Complete {3 - progress} more to unlock your reward."
+            )
+            self.show_dashboard()
+            return
+
         if self.db.claim_challenge(challenge["day"]):
             self.db.add_xp(challenge["xp"], "Daily challenge")
-            messagebox.showinfo("Challenge complete", f"You earned {challenge['xp']} bonus XP!")
-            self.show_dashboard()
+            messagebox.showinfo(
+                "Challenge complete",
+                f"You completed all three missions!\n"
+                f"You earned {challenge['xp']} bonus XP!"
+            )
+        else:
+            messagebox.showinfo(
+                "Reward unavailable",
+                "The challenge has already been claimed or is no longer available."
+            )
+
+        self.show_dashboard()
 
     def show_tasks(self):
         self.navigate_style("Tasks")
@@ -464,7 +507,7 @@ class LifeQuestApp(tk.Tk):
 
     def add_task_dialog(self, existing=None):
         win = tk.Toplevel(self); win.title("Mission details"); win.configure(bg=PANEL)
-        win.geometry("430x390"); win.resizable(False, False); win.transient(self); win.grab_set()
+        win.geometry("570x500"); win.resizable(False, False); win.transient(self); win.grab_set()
         tk.Label(win, text="MISSION DETAILS", bg=PANEL, fg=TEXT,
                  font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=22, pady=(20, 12))
         fields = tk.Frame(win, bg=PANEL); fields.pack(fill="x", padx=22)
@@ -556,40 +599,59 @@ class LifeQuestApp(tk.Tk):
         tk.Button(left, text="+ New note", command=lambda: self.new_note(), bg=PURPLE_DARK,
                   fg="white", relief="flat", padx=12, pady=8).pack(fill="x", pady=(0, 10))
         notes = self.db.get_notes()
-        lb = tk.Listbox(left, bg=PANEL2, fg=TEXT, selectbackground=PURPLE_DARK,
+        lb = tk.Listbox(left, bg=PANEL2, fg="#c4b5fd", selectbackground=PURPLE_DARK,
                         relief="flat", font=("Segoe UI", 10), activestyle="none")
         lb.pack(fill="both", expand=True)
-        for n in notes: lb.insert("end", n["title"])
-        title = tk.Entry(right, bg=PANEL2, fg=TEXT, insertbackground=TEXT, relief="flat",
+        for n in notes:
+            prefix = "[Notion] " if n.get("source") == "notion" else ""
+            lb.insert("end", prefix + (n["title"] or "Untitled note"))
+        title = tk.Entry(right, bg=PANEL2, fg=TEXT, readonlybackground=PANEL2, insertbackground=TEXT, relief="flat",
                          font=("Segoe UI", 13, "bold"))
         title.pack(fill="x", ipady=9, pady=(0, 10))
         body = tk.Text(right, bg=PANEL2, fg=TEXT, insertbackground=TEXT, relief="flat",
                        wrap="word", font=("Segoe UI", 10))
         body.pack(fill="both", expand=True)
         selected = {"id": None}
+        selected_note = {"source": "local"}
         def load(_=None):
             if not lb.curselection(): return
             n = notes[lb.curselection()[0]]
             selected["id"] = n["id"]
+            selected_note["source"] = n.get("source", "local")
+            title.configure(state="normal"); body.configure(state="normal")
             title.delete(0, "end"); title.insert(0, n["title"])
             body.delete("1.0", "end"); body.insert("1.0", n["body"])
+            if selected_note["source"] == "notion":
+                title.configure(state="readonly"); body.configure(state="disabled")
+                save_button.configure(state="disabled"); delete_button.configure(state="disabled")
+            else:
+                save_button.configure(state="normal"); delete_button.configure(state="normal")
         lb.bind("<<ListboxSelect>>", load)
         def save():
+            if selected_note["source"] == "notion":
+                messagebox.showinfo("Notion note is read-only", "Edit this page in Notion, then sync again."); return
             name = title.get().strip()
             if not name: messagebox.showwarning("Missing title", "Enter a note title."); return
             if selected["id"]: self.db.update_note(selected["id"], name, body.get("1.0", "end").strip())
-            else: self.db.add_note(name, body.get("1.0", "end").strip())
-            messagebox.showinfo("Saved", "Note saved.")
-            self.show_notes()
+            else: selected["id"] = self.db.add_note(name, body.get("1.0", "end").strip())
+            messagebox.showinfo("Saved", "Note saved."); self.show_notes()
         def delete():
+            if selected_note["source"] == "notion":
+                messagebox.showinfo("Notion note is read-only", "Remove or archive this page in Notion."); return
             if selected["id"] and messagebox.askyesno("Delete note", "Delete this note?"):
                 self.db.delete_note(selected["id"]); self.show_notes()
         buttons = tk.Frame(right, bg=PANEL); buttons.pack(fill="x", pady=(10, 0))
-        tk.Button(buttons, text="Save note", command=save, bg=PURPLE_DARK, fg="white", relief="flat", padx=12, pady=7).pack(side="left")
-        tk.Button(buttons, text="Delete note", command=delete, bg="#512b3a", fg="#ffdce4", relief="flat", padx=12, pady=7).pack(side="left", padx=8)
-        if notes: lb.selection_set(0); load()
-        self._notes_new = lambda: (selected.update({"id": None}), title.delete(0, "end"),
-                                           body.delete("1.0", "end"), lb.selection_clear(0, "end"))
+        save_button = tk.Button(buttons, text="Save note", command=save, bg=PURPLE_DARK, fg="white", relief="flat", padx=12, pady=7); save_button.pack(side="left")
+        delete_button = tk.Button(buttons, text="Delete note", command=delete, bg="#512b3a", fg="#ffdce4", relief="flat", padx=12, pady=7); delete_button.pack(side="left", padx=8)
+        if notes:
+            lb.selection_set(0)
+            load()
+        def make_new_note():
+            selected.update({"id": None}); selected_note["source"] = "local"
+            title.configure(state="normal"); body.configure(state="normal")
+            title.delete(0, "end"); body.delete("1.0", "end"); lb.selection_clear(0, "end")
+            save_button.configure(state="normal"); delete_button.configure(state="normal")
+        self._notes_new = make_new_note
         # Replace the button command with the editor-aware blank-note action.
         for child in left.winfo_children():
             if isinstance(child, tk.Button):
@@ -601,6 +663,8 @@ class LifeQuestApp(tk.Tk):
         # selected id remains None.
 
     def show_trello(self):
+        self.clear_content()
+
         self.navigate_style("Trello")
         self.header("Trello Integration", "Read your Trello boards and turn cards into LifeQuest missions.")
         if not self.trello_client:
@@ -614,6 +678,7 @@ class LifeQuestApp(tk.Tk):
                       bg=PURPLE_DARK, fg="white", relief="flat", padx=16, pady=10).pack(anchor="w")
             tk.Label(self.content, text="You'll need a Trello API key and a read-only token. Credentials stay in memory and are cleared when LifeQuest closes.",
                      bg=BG, fg=MUTED, wraplength=700, justify="left").pack(anchor="w", pady=12)
+            self.show_notion_panel()
             return
     
         panel = tk.Frame(self.content, bg=PANEL, padx=18, pady=16)
@@ -674,59 +739,206 @@ class LifeQuestApp(tk.Tk):
                  wraplength=700, justify="left").pack(anchor="w")
         tk.Label(self.content, text="Auto-sync checks Trello every 60 seconds while LifeQuest is open. Credentials remain in memory. Trello cards are never edited by LifeQuest.",
                  bg=BG, fg=MUTED, wraplength=700, justify="left").pack(anchor="w", pady=(8, 0))
-        if board_names and not self.trello_lists:
-            self.load_trello_lists()
+        if board_names and self.trello_lists_loaded_for_board == self.trello_selected_board_id and not self.trello_lists:
+            tk.Label(self.content, text="This board returned no lists. Check that it contains lists and that your Trello account can view them.",
+                 bg=BG, fg=GOLD, wraplength=700, justify="left").pack(anchor="w", pady=(8, 0))
+
+    def show_notion_panel(self):
+        panel = tk.Frame(self.content, bg=PANEL, padx=18, pady=16)
+        panel.pack(fill="x", pady=(0, 14))
+        tk.Label(panel, text="NOTION NOTES", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        tk.Label(panel, text="Import Notion database pages into LifeQuest Notes, keeping each page title and its written content. Read-only.",
+                 bg=PANEL, fg=MUTED, wraplength=700, justify="left").pack(anchor="w", pady=(5, 10))
+        if self.notion_client:
+            account = (self.notion_user or {}).get("name") or "Notion integration"
+            tk.Label(panel, text=f"CONNECTED · {account}", bg=PANEL, fg=GREEN,
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 8))
+        else:
+            tk.Label(panel, text="Connect with an internal integration token", bg=PANEL, fg=TEXT).pack(anchor="w")
+            token_row = tk.Frame(panel, bg=PANEL)
+            token_row.pack(fill="x", pady=(5, 8))
+            self.notion_token_entry = tk.Entry(token_row, show="•", bg=PANEL2, fg=TEXT,
+                                               insertbackground=TEXT, relief="flat")
+            self.notion_token_entry.pack(side="left", fill="x", expand=True, ipady=7)
+            tk.Button(token_row, text="Connect Notion", command=self.connect_notion,
+                      bg=PURPLE_DARK, fg="white", relief="flat", padx=12, pady=7).pack(side="left", padx=(8, 0))
+        db_row = tk.Frame(panel, bg=PANEL)
+        db_row.pack(fill="x", pady=(4, 8))
+        tk.Label(db_row, text="NOTES DATABASE ID", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 10))
+        self.notion_database_entry = tk.Entry(db_row, bg=PANEL2, fg=TEXT,
+                                              insertbackground=TEXT, relief="flat")
+        self.notion_database_entry.pack(side="left", fill="x", expand=True, ipady=7)
+        self.notion_database_entry.insert(0, self.notion_database_id)
+        tk.Button(db_row, text="Load database", command=self.load_notion_database,
+                  bg=PANEL2, fg=TEXT, relief="flat", padx=12, pady=7).pack(side="left", padx=(8, 0))
+        action_row = tk.Frame(panel, bg=PANEL)
+        action_row.pack(fill="x")
+        tk.Button(action_row, text="↻ Sync notes", command=self.sync_notion,
+                  bg=PURPLE_DARK, fg="white", relief="flat", padx=14, pady=8).pack(side="left")
+        if self.notion_client:
+            tk.Button(action_row, text="Disconnect", command=self.disconnect_notion,
+                      bg="#512b3a", fg="#ffdce4", relief="flat", padx=12, pady=8).pack(side="left", padx=8)
+        tk.Label(panel, text=f"{self.db.get_notion_note_count()} Notion notes imported",
+                 bg=PANEL, fg=MUTED).pack(anchor="w", pady=(9, 2))
+        tk.Label(panel, text=self.notion_status, bg=PANEL, fg=GREEN if self.notion_client else MUTED,
+                 wraplength=700, justify="left").pack(anchor="w")
+        tk.Label(panel, text="Setup: create an internal integration with Read content access, share your database with it, then paste its token and the database ID. Credentials stay in memory and are cleared when LifeQuest closes.",
+                 bg=PANEL, fg=MUTED, wraplength=700, justify="left").pack(anchor="w", pady=(8, 0))
 
     def connect_trello_dialog(self):
         win = tk.Toplevel(self)
         win.title("Connect Trello — read-only")
-        win.configure(bg=PANEL); win.geometry("540x430"); win.resizable(False, False)
-        win.transient(self); win.grab_set()
+        win.configure(bg=PANEL) 
+        win.geometry("570x570") 
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+        self.trello_auth_window = win
+        
         tk.Label(win, text="CONNECT TRELLO", bg=PANEL, fg=TEXT,
-                 font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=22, pady=(20, 8))
-        tk.Label(win, text="1. Create or open a Trello Power-Up to obtain an API key.",
-                 bg=PANEL, fg=MUTED, wraplength=490, justify="left").pack(anchor="w", padx=22, pady=4)
-        tk.Button(win, text="Open Trello developer portal",
-                  command=lambda: webbrowser.open("https://trello.com/apps/admin"),
-                  bg=PANEL2, fg=TEXT, relief="flat", padx=10, pady=7).pack(anchor="w", padx=22, pady=4)
+                         font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=22, pady=(20, 8))
+        tk.Label(win, text="1. Open your Trello Power-Up settings and copy its API key.", bg=PANEL, fg=MUTED, 
+                         wraplength=520, justify="left").pack(anchor="w", padx=22, pady=4)
+        tk.Button(win, text="Open Trello developer portal", command=lambda: webbrowser.open("https://trello.com/apps/admin"), 
+                         bg=PANEL2, fg=TEXT, relief="flat", padx=10, pady=7).pack(anchor="w", padx=22, pady=4)
         tk.Label(win, text="API key", bg=PANEL, fg=TEXT).pack(anchor="w", padx=22, pady=(12, 3))
+                
         key_entry = tk.Entry(win, bg=PANEL2, fg=TEXT, insertbackground=TEXT, relief="flat")
         key_entry.pack(fill="x", padx=22, ipady=8)
-        tk.Label(win, text="2. Generate a token with read-only permission.",
-                 bg=PANEL, fg=MUTED).pack(anchor="w", padx=22, pady=(12, 4))
-        def open_auth():
-            key = key_entry.get().strip()
-            if not key:
-                messagebox.showwarning("API key required", "Enter your Trello API key first.", parent=win); return
-            params = urllib.parse.urlencode({
-                "expiration": "30days", "scope": "read", "response_type": "token",
-                "key": key, "name": "LifeQuest"
-            })
-            webbrowser.open("https://trello.com/1/authorize?" + params)
-        tk.Button(win, text="Generate read-only token", command=open_auth,
-                bg=PANEL2, fg=TEXT, relief="flat", padx=10, pady=7).pack(anchor="w", padx=22)
-        tk.Label(win, text="Paste the token Trello gives you below.", bg=PANEL, fg=TEXT).pack(anchor="w", padx=22, pady=(12, 3))
-        token_entry = tk.Entry(win, bg=PANEL2, fg=TEXT, insertbackground=TEXT, relief="flat", show="•")
-        token_entry.pack(fill="x", padx=22, ipady=8)
-        tk.Label(win, text="Credentials are kept only in memory for this app session. Never share your token.",
-                bg=PANEL, fg=GOLD, wraplength=490, justify="left").pack(anchor="w", padx=22, pady=10)
-        def connect():
+        
+        tk.Label(win, text="2. In your Power-Up's Trello Auth settings, add this Allowed Origin exactly:",
+                         bg=PANEL, fg=MUTED, wraplength=520, justify="left").pack(anchor="w", padx=22, pady=(13, 4))
+        origin_box = tk.Frame(win, bg=PANEL2, padx=10, pady=8)
+        origin_box.pack(fill="x", padx=22)
+        tk.Label(origin_box, text="http://localhost:8765", bg=PANEL2, fg=GOLD,
+                         font=("Consolas", 10, "bold")).pack(side="left")
+        tk.Button(origin_box, text="Copy", command=lambda: (self.clipboard_clear(), self.clipboard_append("http://localhost:8765")),
+                         bg="#35334a", fg=TEXT, relief="flat", padx=8, pady=3).pack(side="right")
+        tk.Label(win, text="3. Click the button below. Trello will ask for read-only access and return the token directly to LifeQuest.",
+                         bg=PANEL, fg=MUTED, wraplength=520, justify="left").pack(anchor="w", padx=22, pady=(12, 7))
+
+        def stop_callback_server():
+            if self.trello_auth_poll_id is not None:
+                try:
+                    self.after_cancel(self.trello_auth_poll_id)
+                except tk.TclError:
+                    pass
+                self.trello_auth_poll_id = None
+
+            server = self.trello_callback_server
+            self.trello_callback_server = None
+            
+            if server is not None:
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+
+        def finish_connection(token):
             try:
-                client = TrelloClient(key_entry.get(), token_entry.get())
+                client = TrelloClient(key_entry.get(), token)
                 member = client.get_member()
                 boards = client.get_boards()
+
                 self.trello_client = client
                 self.trello_member = member
                 self.trello_boards = boards
                 self.trello_lists = []
-                win.destroy()
+                self.trello_lists_loaded_for_board = None
+                stop_callback_server()
+
+                if win.winfo_exists():
+                    win.destroy()
+
+                self.trello_auth_window = None
                 self.show_trello()
+
                 if not boards:
-                    messagebox.showinfo("No boards found", "The connected Trello account has no open boards available.")
+                    messagebox.showinfo("No boards found", "Trello connected successfully, but this account has no open boards available.")
             except (TrelloAPIError, ValueError) as exc:
+                stop_callback_server()
                 messagebox.showerror("Trello connection failed", str(exc), parent=win)
-        tk.Button(win, text="Connect & load boards", command=connect,
-                bg=PURPLE_DARK, fg="white", relief="flat", padx=16, pady=9).pack(anchor="e", padx=22, pady=(0, 18))
+
+        def poll_callback():
+            self.trello_auth_poll_id = None
+            server = self.trello_callback_server
+
+            if server is None:
+                return
+            if server.token:
+                finish_connection(server.token)
+                return
+            if server.error:
+                stop_callback_server()
+                messagebox.showerror("Trello authorization failed", server.error, parent=win)
+                return
+            if win.winfo_exists():
+                self.trello_auth_poll_id = self.after(350, poll_callback)
+
+        def open_auth():
+            key = key_entry.get().strip()
+            if not key:
+                messagebox.showwarning("API key required", "Enter your Trello API key first.", parent=win)
+                return
+        
+            try:
+                stop_callback_server()
+                callback_server = TrelloCallbackServer(("127.0.0.1", 8765))
+                self.trello_callback_server = callback_server
+                self.trello_callback_thread = threading.Thread(target=callback_server.serve_forever, daemon=True)
+                self.trello_callback_thread.start()
+            except OSError as exc:
+                self.trello_callback_server = None
+                messagebox.showerror(
+                    "Local callback unavailable",
+                    f"LifeQuest could not start its local callback listener on port 8765. "
+                    f"Close any app using that port and try again.\n\n{exc}",
+                    parent=win
+                )
+                return
+        
+            params = urllib.parse.urlencode({
+                "expiration": "30days",
+                "scope": "read",
+                "key": key,
+                "name": "LifeQuest",
+                "callback_method": "fragment",
+                "return_url": "http://localhost:8765/callback"
+            })
+            self.trello_auth_poll_id = self.after(350, poll_callback)
+            opened = webbrowser.open("https://trello.com/1/authorize?" + params)
+            if not opened:
+                tk.Label(win, text="If your browser did not open, use the button again or open the Trello authorization link manually.",
+                         bg=PANEL, fg=GOLD, wraplength=520, justify="left").pack(anchor="w", padx=22, pady=5)
+
+        tk.Button(win, text="Authorize Trello & connect automatically", command=open_auth, bg=PURPLE_DARK, fg="white",
+                         relief="flat", padx=16, pady=10).pack(anchor="w", padx=22, pady=(10, 8))
+        tk.Label(win, text="LifeQuest requests read-only access. Your API key and token stay in memory only and are cleared when the app closes.",
+                         bg=PANEL, fg=GOLD, wraplength=520, justify="left").pack(anchor="w", padx=22, pady=(4, 12))
+        
+        def close_dialog():
+            stop_callback_server()
+            self.trello_auth_window = None
+            win.destroy()
+        
+        win.protocol("WM_DELETE_WINDOW", close_dialog)
+
+    def connect_notion(self):
+        token = self.notion_token_entry.get().strip()
+        if not token:
+            messagebox.showinfo("Notion token required", "Paste your Notion internal integration token first.")
+            return
+        try:
+            client = NotionClient(token)
+            user = client.get_user()
+            self.notion_client, self.notion_user = client, user
+            self.notion_status = "Connected. Enter a database ID and load it."
+            self.show_trello()
+        except NotionAPIError as exc:
+            messagebox.showerror("Notion connection failed", str(exc))
 
     def disconnect_trello(self):
         self.stop_trello_auto_sync()
@@ -735,8 +947,18 @@ class LifeQuestApp(tk.Tk):
         self.trello_member = None
         self.trello_boards = []
         self.trello_lists = []
+        self.trello_lists_loaded_for_board = None
         self.trello_selected_board_id = None
         self.trello_done_list_ids = set()
+        self.show_trello()
+
+    def disconnect_notion(self):
+        self.notion_client = None
+        self.notion_user = None
+        self.notion_data_source_id = None
+        self.notion_database_id = ""
+        self.notion_database_name = ""
+        self.notion_status = "Not connected"
         self.show_trello()
     
     def on_trello_board_changed(self, _event=None):
@@ -744,6 +966,7 @@ class LifeQuestApp(tk.Tk):
         if board:
             self.trello_selected_board_id = board["id"]
             self.trello_lists = []
+            self.trello_lists_loaded_for_board = None
             self.trello_done_list_ids = set()
 
     def _selected_trello_board(self):
@@ -763,33 +986,59 @@ class LifeQuestApp(tk.Tk):
                      if b["id"] == self.trello_selected_board_id), None)
 
     def load_trello_lists(self):
-        board = self._selected_trello_board()
-        if board is None:
-            messagebox.showinfo("Choose a board", "Select a Trello board first.")
-            return
-        
-        if self.trello_client is None:
+        client: TrelloClient | None = self.trello_client
+        if client is None:
             messagebox.showinfo("Connect Trello", "Connect your Trello account first.")
             return
         
+        board = self._selected_trello_board()
+        if not board:
+            messagebox.showinfo("Choose a board", "Select a Trello board first.")
+            return
+
+        board_id = board["id"]
         try:
-            board_id = board["id"]
-            
+            loaded_lists = client.get_lists(board_id)
             self.trello_selected_board_id = board_id
-            self.trello_lists = self.trello_client.get_lists(board_id)
-
+            self.trello_lists = loaded_lists
+            self.trello_lists_loaded_for_board = board_id
             self.trello_done_list_ids = {
-                item["id"]
-                for item in self.trello_lists
-                if any(
-                    keyword in item["name"].lower()
-                    for keyword in ("done", "complete", "finished")
-                )
+                item["id"] for item in loaded_lists
+                if any(k in item["name"].lower() for k in ("done", "complete", "finished"))
             }
-
+            if not loaded_lists:
+                self.trello_status = "Connected, but Trello returned zero lists for this board."
+            else:
+                self.trello_status = f"Loaded {len(loaded_lists)} lists from {board['name']}."
             self.show_trello()
         except TrelloAPIError as exc:
+            self.trello_lists_loaded_for_board = None
+            self.trello_status = f"Could not load lists: {exc}"
             messagebox.showerror("Could not load lists", str(exc))
+
+    def load_notion_database(self):
+        if not self.notion_client:
+            messagebox.showinfo("Connect Notion", "Connect your Notion integration first.")
+            return
+        database_id = self.notion_database_entry.get().strip()
+        if not database_id:
+            messagebox.showinfo("Database ID required", "Paste the ID of a database shared with your integration.")
+            return
+        try:
+            database = self.notion_client.get_database(database_id)
+            sources = database.get("data_sources") or []
+            if not sources:
+                raise NotionAPIError("No accessible data source found. Check that the database is shared with the integration.")
+            source = sources[0]
+            if not source.get("id"):
+                raise NotionAPIError("Notion returned a database without a data source ID.")
+            self.notion_database_id = database_id
+            self.notion_data_source_id = source["id"]
+            self.notion_database_name = source.get("name") or "Notion database"
+            self.notion_status = f"Loaded {self.notion_database_name}. Ready to import notes."
+            self.show_trello()
+        except NotionAPIError as exc:
+            messagebox.showerror("Could not load Notion database", str(exc))
 
     def sync_trello(self, automatic=False):
         """Fetch cards off the UI thread; apply database updates on Tk's main thread."""
@@ -825,10 +1074,6 @@ class LifeQuestApp(tk.Tk):
         client = self.trello_client
         board_id = board["id"]
         board_name = board["name"]
-
-        if client is None:
-            self.trello_sync_in_progress = False
-            return
     
         def worker():
             try:
@@ -839,6 +1084,50 @@ class LifeQuestApp(tk.Tk):
     
         threading.Thread(target=worker, daemon=True).start()
         self.after(150, self._poll_trello_sync_queue)
+
+    def sync_notion(self):
+        if not self.notion_client:
+            messagebox.showinfo("Connect Notion", "Connect your Notion integration first.")
+            return
+        if not self.notion_data_source_id:
+            self.load_notion_database()
+            if not self.notion_data_source_id:
+                return
+        if self.notion_sync_in_progress:
+            return
+        self.notion_sync_in_progress = True
+        self.notion_status = "Syncing Notion pages into Notes..."
+        self.show_trello()
+        client, source_id = self.notion_client, self.notion_data_source_id
+
+        def worker():
+            try:
+                pages = client.query_data_source(source_id)
+                notes = [
+                    page_to_note(page, client)
+                    for page in pages
+                ]
+
+                self.notion_sync_queue.put(("success", notes))
+                print("\n========== NOTION RAW PAGE ==========")
+                if pages:
+                    print(json.dumps(pages[0], indent=4, ensure_ascii=False))
+                else:
+                    print("No pages returned by Notion.")
+                print("====================================\n")
+
+                if pages:
+                    page_id = pages[0]["id"]
+                    
+                    print("\n========== NOTION PAGE BLOCKS ==========")
+                    blocks = client.get_block_children(page_id)
+                    print(json.dumps(blocks, indent=4, ensure_ascii=False))
+                    print("========================================\n")
+            except Exception as exc:
+                traceback.print_exc()
+                self.notion_sync_queue.put(("error", str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(150, self._poll_notion_sync_queue)
 
     def _poll_trello_sync_queue(self):
         try:
@@ -871,6 +1160,12 @@ class LifeQuestApp(tk.Tk):
                 outcome, awarded = self.db.sync_trello_card(
                     card, list_names.get(card.get("idList"), ""), is_completed
                 )
+                saved = self.db.conn.execute(
+                    "SELECT title, category, external_id FROM tasks WHERE source='trello' AND external_id=?",
+                    (card["id"],)
+                ).fetchone()
+                print("TRELLO DATABASE CHECK:", dict(saved) if saved else "NOT FOUND")
+                
                 if outcome == "imported":
                     imported += 1
                 else:
@@ -902,6 +1197,29 @@ class LifeQuestApp(tk.Tk):
             if self.current_page == "Trello":
                 self.show_trello()
         self._schedule_next_auto_sync()
+
+    def _poll_notion_sync_queue(self):
+        try: result=self.notion_sync_queue.get_nowait()
+        except queue.Empty:
+            if self.notion_sync_in_progress: self.after(150,self._poll_notion_sync_queue)
+            return
+        self.notion_sync_in_progress=False; kind,payload=result
+        if kind=="error":
+            self.notion_status=f"Last sync failed: {payload}"
+            messagebox.showerror("Notion notes sync failed",payload)
+        else:
+            imported=updated=0
+            try:
+                for note in payload:
+                    outcome=self.db.sync_notion_note(note)
+                    imported+=int(outcome=="imported"); updated+=int(outcome=="updated")
+                self.notion_status=f"Last sync successful: {datetime.now().strftime('%H:%M:%S')} — {len(payload)} notes checked."
+                messagebox.showinfo("Notion notes sync complete",f"Database: {self.notion_database_name}\nPages checked: {len(payload)}\nNew notes imported: {imported}\nExisting notes updated: {updated}\n\nFind them under the Notes section.")
+            except Exception as exc:
+                self.notion_status=f"Could not save Notion notes: {exc}"
+                messagebox.showerror("Notion notes sync failed",str(exc))
+        if self.current_page=="Trello": self.show_trello()
+        elif self.current_page=="Notes": self.show_notes()
 
     def show_trello_status(self):
         # Re-rendering is intentionally avoided while the background request is running.

@@ -36,7 +36,11 @@ class Database:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             body TEXT DEFAULT '',
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'local',
+            external_id TEXT,
+            source_url TEXT,
+            source_updated_at TEXT
         );
         CREATE TABLE IF NOT EXISTS xp_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +84,11 @@ class Database:
         );
         """)
         # Safe, additive migration for databases created by earlier LifeQuest versions.
+        note_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(notes)")}
+        note_migrations = {"source": "TEXT NOT NULL DEFAULT 'local'", "external_id": "TEXT", "source_url": "TEXT", "source_updated_at": "TEXT"}
+        for column, definition in note_migrations.items():
+            if column not in note_columns: self.conn.execute(f"ALTER TABLE notes ADD COLUMN {column} {definition}")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_external_source ON notes(source, external_id) WHERE external_id IS NOT NULL")
         existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)")}
         migrations = {
             "category": "TEXT NOT NULL DEFAULT 'General'",
@@ -98,6 +107,32 @@ class Database:
                     self.conn.execute("ALTER TABLE xp_history ADD COLUMN category TEXT NOT NULL DEFAULT 'General'")
         self.conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external_source
                              ON tasks(source, external_id) WHERE external_id IS NOT NULL""")
+        self.conn.execute("""
+            INSERT OR IGNORE INTO activity_log(activity_type, activity_id, title, completed_at)
+            SELECT CASE WHEN source='trello' THEN 'trello_task' ELSE 'task' END,
+                   CASE WHEN external_id IS NOT NULL THEN external_id ELSE CAST(id AS TEXT) END,
+                   title, completed_at
+            FROM tasks
+            WHERE status='done' AND completed_at IS NOT NULL
+        """)
+        self.conn.commit()
+
+    def _ensure_notes_schema(self):
+        """Safely upgrade notes created by older LifeQuest versions."""
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(notes)")}
+        migrations = {
+            "source": "TEXT NOT NULL DEFAULT 'local'",
+            "external_id": "TEXT",
+            "source_url": "TEXT",
+            "source_updated_at": "TEXT",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE notes ADD COLUMN {column} {definition}")
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_external_source
+               ON notes(source, external_id) WHERE external_id IS NOT NULL"""
+        )
         self.conn.commit()
 
     def _seed_challenge(self):
@@ -303,10 +338,60 @@ class Database:
         
         return dict(row)
 
+    def get_daily_challenge_progress(self, day=None):
+        day = day or date.today().isoformat()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS completed
+            FROM activity_log
+            WHERE substr(completed_at, 1, 10) = ?
+              AND activity_type IN ('task', 'trello_task')
+            """,
+            (day,)
+        ).fetchone()
+
+        return min(row["completed"], 3)
+
     def claim_challenge(self, day):
-        cur = self.conn.execute("UPDATE challenges SET claimed=1 WHERE day=? AND claimed=0", (day,))
-        self.conn.commit()
-        return cur.rowcount == 1
+        today = date.today().isoformat()
+
+        if day != today:
+            return False
+
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+
+            progress = self.conn.execute(
+                """
+                SELECT COUNT(*) AS completed
+                FROM activity_log
+                WHERE substr(completed_at, 1, 10) = ?
+                  AND activity_type IN ('task', 'trello_task')
+                """,
+                (today,)
+            ).fetchone()["completed"]
+            if progress < 3:
+                self.conn.rollback()
+                return False
+
+            cur = self.conn.execute(
+                """
+                UPDATE challenges
+                SET claimed = 1
+                WHERE day = ? AND claimed = 0
+                """,
+                (today,)
+            )
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return False
+
+            self.conn.commit()
+            return True
+
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def get_activity_dates(self):
         rows = self.conn.execute(
@@ -375,7 +460,7 @@ class Database:
                 """INSERT INTO tasks
                    (title,description,difficulty,due_date,xp,category,status,completed_at,created_at,
                     source,external_id,source_url,source_updated_at,source_completed,xp_awarded)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
                 (title, description, difficulty, due, xp, list_name or "Trello",
                 "done" if is_completed else "open", None, now,
                 "trello", external_id, url, updated, int(bool(is_completed)))
@@ -405,10 +490,34 @@ class Database:
             self._record_activity('trello_task', external_id, title, now)
         self.conn.commit()
         return ("updated" if not award_xp else "completed"), award_xp
+
+    def sync_notion_note(self, note):
+        """Upsert a Notion page into Notes; never creates a task or awards XP."""
+        external_id=note.get("external_id")
+        if not external_id: raise ValueError("Notion page is missing its page ID.")
+        title=(note.get("title") or "").strip() or "Untitled Notion note"
+        body=note.get("body") or ""; url=note.get("source_url") or ""; source_updated=note.get("source_updated_at") or ""
+        now=datetime.now().isoformat(timespec="seconds")
+        row=self.conn.execute("SELECT id FROM notes WHERE source='notion' AND external_id=?",(external_id,)).fetchone()
+        if row:
+            self.conn.execute("UPDATE notes SET title=?,body=?,updated_at=?,source_url=?,source_updated_at=? WHERE id=?",(title,body,now,url,source_updated,row["id"]))
+            outcome="updated"
+        else:
+            self.conn.execute("INSERT INTO notes(title,body,updated_at,source,external_id,source_url,source_updated_at) VALUES(?,?,?,?,?,?,?)",(title,body,now,"notion",external_id,url,source_updated))
+            outcome="imported"
+        self.conn.commit(); return outcome
     
     def get_trello_task_count(self):
         row = self.conn.execute("SELECT COUNT(*) AS n FROM tasks WHERE source='trello'").fetchone()
         return row["n"]
+
+    def get_notion_note_count(self):
+        # Defensive call also repairs databases opened from older project builds.
+        self._ensure_notes_schema()
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM notes WHERE source='notion'"
+        ).fetchone()["n"]
+
 
     def close(self):
         self.conn.close()
